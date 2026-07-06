@@ -81,14 +81,17 @@ ATENEA-ML-ConveniosEducativos/
 
 ---
 
-## Cómo ejecutar
+## Ver el reporte
 
-1. Instala R (https://cran.r-project.org/) y RStudio.
-2. Abre `ATENEA_ML_ConveniosEducativos.Rmd` en RStudio.
-3. Pulsa **Knit** (o `Cmd+Shift+K`). Los paquetes, incluido `ROSE`, se instalan solos.
+El análisis completo está en `ATENEA_ML_ConveniosEducativos.html`. Ábrelo de una de estas formas:
 
-El script lee el Excel de la carpeta `datos/`, construye la etiqueta, entrena y evalúa los
-modelos, trata el desbalance y genera el reporte HTML.
+- **Un clic (renderizado en el navegador):**
+  [Abrir el reporte](https://htmlpreview.github.io/?https://github.com/Danisolre/ATENEA-ML-ConveniosEducativos/blob/main/ATENEA_ML_ConveniosEducativos.html)
+- **Opción segura (siempre funciona):** entra al archivo
+  `ATENEA_ML_ConveniosEducativos.html`, pulsa **"Download raw file"** y ábrelo en tu
+  navegador.
+- **Reproducirlo desde cero:** abre `ATENEA_ML_ConveniosEducativos.Rmd` en RStudio y pulsa
+  **Knit** (ver "Cómo ejecutar" más abajo).
 
 ---
 
