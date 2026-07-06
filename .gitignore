@@ -1,0 +1,12 @@
+# R
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# Salidas generadas (descomenta si NO quieres subir el HTML)
+# ATENEA_ML_ConveniosEducativos.html
+
+# Sistema
+.DS_Store
+Thumbs.db
