@@ -1,0 +1,634 @@
+---
+title: "Predicción de Convenios Educativos en ATENEA"
+subtitle: "Machine Learning para Política Pública - Identificando factores que predicen acceso a educación superior"
+author: "Análisis de Datos - ATENEA"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    number_sections: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+# code_folding: hide  -> el código queda oculto pero desplegable (reproducibilidad
+# sin ensuciar el reporte). fig.align centra las gráficas en el HTML.
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  message   = FALSE,
+  warning   = FALSE,
+  fig.width = 10,
+  fig.height = 6,
+  fig.align = "center",
+  dpi       = 110
+)
+
+options(repos = c(CRAN = "https://cloud.r-project.org/"))
+```
+
+---
+
+# Introducción y Objetivos
+
+## Contexto
+
+La Agencia ATENEA canaliza una parte importante de su presupuesto en convenios con
+Instituciones de Educación Superior (IES). Este proyecto aplica **Machine Learning**
+para:
+
+- Identificar automáticamente convenios educativos en SECOP II
+- Analizar qué factores los caracterizan
+- Generar insumos para política pública en educación
+
+**Pregunta central:** ¿qué características de los contratos predicen que se trate de un
+convenio educativo con una IES?
+
+> Nota metodológica: la cifra exacta de inversión en IES se calcula más abajo, a partir
+> de los datos, y no se afirma de memoria.
+
+---
+
+# Setup y Librerías
+
+```{r instalar-paquetes}
+paquetes <- c(
+  "tidyverse",     # Manipulación de datos
+  "readxl",        # Leer Excel
+  "caret",         # Machine Learning
+  "randomForest",  # Random Forest
+  "pROC",          # Curvas ROC
+  "ROSE",          # Re-muestreo para desbalance de clase (Sesión 4)
+  "knitr",         # Tablas
+  "ggplot2"        # Visualización
+)
+
+for (pkg in paquetes) {
+  if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
+    install.packages(pkg, quiet = TRUE)
+    library(pkg, character.only = TRUE, quietly = TRUE)
+  }
+}
+
+# Tema global para las gráficas
+theme_set(
+  theme_minimal() +
+    theme(
+      plot.title    = element_text(face = "bold", size = 13),
+      plot.subtitle = element_text(size = 10, color = "gray40")
+    )
+)
+
+set.seed(2026)  # Reproducibilidad
+```
+
+---
+
+# Carga de Datos
+
+```{r carga-datos}
+# Busca el Excel en la raíz o en datos/
+archivos <- c(
+  list.files(pattern = "^SECOP_ATENEA.*\\.xlsx$", ignore.case = TRUE, full.names = TRUE),
+  list.files(path = "datos", pattern = "^SECOP_ATENEA.*\\.xlsx$", ignore.case = TRUE, full.names = TRUE)
+)
+
+if (length(archivos) == 0) {
+  stop("No se encontró el Excel SECOP_ATENEA. Colócalo en la raíz o en la carpeta datos/.")
+}
+
+# El más reciente por fecha de modificación
+info_archivos <- file.info(archivos)
+archivo <- rownames(info_archivos)[which.max(info_archivos$mtime)]
+
+datos_raw <- read_excel(archivo, sheet = "SECOP_ATENEA_SEL")
+```
+
+Se cargó el archivo **`r basename(archivo)`** (hoja `SECOP_ATENEA_SEL`) con
+**`r format(nrow(datos_raw), big.mark = ",")`** contratos y
+**`r ncol(datos_raw)`** variables.
+
+---
+
+# Exploración Inicial
+
+```{r exploracion}
+vcol <- "valor_del_contrato (contratos_electronicos)"
+
+resumen_valor <- tibble(
+  Estadística = c("Media", "Mediana", "Máximo"),
+  Valor_COP = c(
+    mean(datos_raw[[vcol]],   na.rm = TRUE),
+    median(datos_raw[[vcol]], na.rm = TRUE),
+    max(datos_raw[[vcol]],    na.rm = TRUE)
+  )
+) %>%
+  mutate(Valor_COP = format(round(Valor_COP), big.mark = ","))
+
+kable(resumen_valor, caption = "Valor del contrato (pesos)")
+```
+
+El valor de los contratos está muy sesgado a la derecha: la mediana es mucho menor que
+la media, señal de que unos pocos contratos muy grandes elevan el promedio. Esto es
+relevante para el modelo, porque el tamaño del contrato termina siendo una de las señales
+más fuertes.
+
+```{r exploracion-anio}
+# Distribución de contratos por año
+tabla_anio <- datos_raw %>%
+  count(`año_inferido`, name = "Contratos") %>%
+  rename(Año = `año_inferido`)
+
+kable(tabla_anio, caption = "Contratos por año")
+```
+
+---
+
+# Preparación de Datos para ML
+
+## Crear la variable objetivo: `es_ies`
+
+```{r crear-target}
+# --- Definición de la etiqueta ------------------------------------------------
+# ADVERTENCIA sobre la etiqueta: se construye por palabras clave en la
+# descripción o el proveedor. Es imperfecta, porque ATENEA es una agencia DE
+# educación superior: palabras como "superior", "educacion" o "institucion"
+# aparecen en muchísimos contratos por el nombre/mandato de la propia entidad,
+# no porque sean convenios con una IES. Con esta lista, ~43% de TODOS los
+# contratos quedan marcados como IES.
+#
+# NO se quitan tildes a propósito: al hacerlo, "tecnica"->"técnica" (asistencia
+# técnica) y "educacion" se disparan y la clase IES sube a ~76% (falsos
+# positivos). Por eso usamos tolower() y NO chartr().
+palabras_ies <- c(
+  "universidad", "ies", "beca", "convocatoria", "estudiante",
+  "educacion", "tecnica", "superior", "investigacion", "institucion",
+  "fondo", "estudiantes"
+)
+patron_ies <- paste(palabras_ies, collapse = "|")
+
+datos <- datos_raw %>%
+  mutate(
+    descripcion_lower = tolower(`descripcion_del_proceso (contratos_electronicos)`),
+    proveedor_lower   = tolower(`proveedor_adjudicado (contratos_electronicos)`),
+
+    # --- ETIQUETA A (por defecto): palabras clave en descripción o proveedor ---
+    es_ies = str_detect(descripcion_lower, patron_ies) |
+             str_detect(proveedor_lower,   patron_ies),
+
+    # --- ETIQUETA B (alternativa, MÁS ESTRICTA): el PROVEEDOR es una IES real ---
+    # Suma ~2,4 billones (coincide con la cifra de "$2.3 billones"). Más honesta
+    # como "convenio con IES", pero más desbalanceada (~10% IES). Para usarla,
+    # comenta la línea es_ies de arriba y descomenta la de abajo:
+    # es_ies = str_detect(proveedor_lower,
+    #   "universidad|corporacion universitaria|fundacion universitaria|politecnico|escuela superior|instituto tecnologico|colegio mayor"),
+
+    es_ies_factor = factor(es_ies, levels = c(TRUE, FALSE), labels = c("IES", "No_IES"))
+  ) %>%
+  select(
+    valor      = `valor_del_contrato (contratos_electronicos)`,
+    plazo      = `duraci_n_del_contrato (contratos_electronicos)`,
+    modalidad  = `modalidad_de_contratacion (contratos_electronicos)`,
+    estado     = `estado vigente_inferido`,
+    año        = `año_inferido`,
+    liquidado  = `liquidado_inferido`,
+    modificado = `modificado_inferido`,
+    es_ies, es_ies_factor
+  ) %>%
+  filter(!is.na(valor), valor > 0, !is.na(plazo)) %>%
+  na.omit()
+
+# Cifras de inversión calculadas desde los datos (para el texto y las conclusiones)
+valor_total_bill <- sum(datos$valor) / 1e12
+valor_ies_bill   <- sum(datos$valor[datos$es_ies]) / 1e12
+pct_ies          <- mean(datos$es_ies) * 100
+```
+
+```{r target-dist}
+dist_tabla <- datos %>%
+  count(es_ies_factor, name = "Contratos") %>%
+  mutate(
+    Porcentaje = round(Contratos / sum(Contratos) * 100, 1),
+    Valor_Total_Billones = round(c(
+      sum(datos$valor[datos$es_ies]),
+      sum(datos$valor[!datos$es_ies])
+    ) / 1e12, 2)
+  ) %>%
+  rename(Tipo = es_ies_factor)
+
+kable(dist_tabla, caption = "Distribución: convenios IES vs. otros")
+```
+
+De los `r format(nrow(datos), big.mark = ",")` contratos analizados,
+**`r round(pct_ies, 1)`%** se clasifican como convenios con IES. Estos concentran
+alrededor de **`r round(valor_ies_bill, 2)` billones** de pesos, frente a
+`r round(valor_total_bill, 2)` billones del total: los convenios IES son pocos en
+número relativo pero muy grandes en monto.
+
+## Ingeniería de variables
+
+```{r features}
+datos_ml <- datos %>%
+  mutate(
+    log_valor      = log10(valor + 1),
+    es_grande      = valor > 500000000,
+    es_muy_grande  = valor > 1000000000,
+
+    es_directa     = str_detect(tolower(modalidad), "directa|gestion"),
+    es_abierta     = str_detect(tolower(modalidad), "abierta|publica|concurso"),
+
+    vigente               = estado == "SI",
+    completamente_liquidado = liquidado == "SI",
+    fue_modificado        = modificado == "SI",
+
+    años_desde_inicio = año - min(año, na.rm = TRUE)
+  ) %>%
+  select(
+    log_valor, es_grande, es_muy_grande, plazo,
+    es_directa, es_abierta, vigente, completamente_liquidado,
+    fue_modificado, años_desde_inicio,
+    es_ies_factor
+  ) %>%
+  mutate(across(where(is.logical), as.numeric)) %>%
+  na.omit()
+```
+
+El conjunto para el modelo tiene **`r nrow(datos_ml)`** filas y
+**`r ncol(datos_ml) - 1`** variables predictoras.
+
+Nota importante: las columnas de texto (`descripcion`, `proveedor`) que se usaron para
+**construir** la etiqueta se excluyen a propósito de las variables predictoras. Si se
+dejaran, el modelo estaría "haciendo trampa" (aprendiendo la misma regla con la que se
+definió el objetivo). El modelo predice a partir de valor, plazo, modalidad y estado.
+
+---
+
+# Machine Learning
+
+## Train-Test Split
+
+```{r split}
+set.seed(2026)
+
+idx_train <- createDataPartition(datos_ml$es_ies_factor, p = 0.7, list = FALSE)
+train_data <- datos_ml[idx_train, ]
+test_data  <- datos_ml[-idx_train, ]
+
+split_tab <- tibble(
+  Conjunto = c("Entrenamiento", "Prueba"),
+  Registros = c(nrow(train_data), nrow(test_data))
+)
+kable(split_tab, caption = "Partición 70/30 (estratificada)")
+```
+
+## Modelo 1: Random Forest
+
+```{r modelo-rf}
+set.seed(2026)  # randomForest NO tiene argumento 'seed'; la semilla se fija aquí.
+
+rf_model <- randomForest(
+  es_ies_factor ~ .,
+  data       = train_data,
+  ntree      = 500,
+  mtry       = 3,
+  nodesize   = 10,
+  importance = TRUE
+)
+
+print(rf_model)
+
+# Importancia de variables (Gini)
+imp_rf <- as.data.frame(rf_model$importance) %>%
+  rownames_to_column("Variable") %>%
+  arrange(desc(MeanDecreaseGini))
+
+kable(
+  imp_rf %>% select(Variable, MeanDecreaseGini) %>% mutate(MeanDecreaseGini = round(MeanDecreaseGini, 2)),
+  caption = "Importancia de variables (Mean Decrease in Gini)"
+)
+```
+
+## Modelo 2: Regresión Logística
+
+```{r modelo-log}
+# --- Corrección importante ----------------------------------------------------
+# glm() con respuesta tipo factor modela la probabilidad del SEGUNDO nivel. Como
+# el factor tiene IES como primer nivel, glm modelaría P(No_IES) y el umbral
+# quedaba invertido. Definimos una variable binaria explícita (IES = 1) para que
+# el modelo prediga P(IES) sin ambigüedad.
+train_glm <- train_data %>% mutate(y_ies = as.integer(es_ies_factor == "IES"))
+
+log_model <- glm(
+  y_ies ~ . - es_ies_factor,   # excluye el factor; usa las mismas predictoras
+  data   = train_glm,
+  family = binomial(link = "logit")
+)
+
+# Coeficientes con p-valores reales (no una regla de magnitud arbitraria)
+coef_log <- summary(log_model)$coefficients %>%
+  as.data.frame() %>%
+  rownames_to_column("Variable") %>%
+  rename(Coeficiente = Estimate, p_valor = `Pr(>|z|)`) %>%
+  mutate(
+    Signif = cut(p_valor,
+                 breaks = c(-Inf, 0.001, 0.01, 0.05, 0.1, Inf),
+                 labels = c("***", "**", "*", ".", ""))
+  ) %>%
+  select(Variable, Coeficiente, p_valor, Signif) %>%
+  mutate(Coeficiente = round(Coeficiente, 3), p_valor = round(p_valor, 4)) %>%
+  arrange(desc(abs(Coeficiente)))
+
+kable(coef_log, caption = "Coeficientes de la regresión logística (P(IES))")
+```
+
+---
+
+# Evaluación de Modelos
+
+## Predicciones
+
+```{r predicciones}
+# Random Forest
+pred_rf_class <- predict(rf_model, test_data)
+pred_rf_prob  <- predict(rf_model, test_data, type = "prob")  # columna "IES" = P(IES)
+
+# Regresión Logística: predict(type="response") ya es P(IES) por la corrección anterior
+pred_log_prob  <- predict(log_model, test_data, type = "response")
+pred_log_class <- factor(ifelse(pred_log_prob > 0.5, "IES", "No_IES"),
+                         levels = c("IES", "No_IES"))
+```
+
+## Matrices de Confusión
+
+```{r confusion}
+cm_rf <- confusionMatrix(pred_rf_class, test_data$es_ies_factor, positive = "IES")
+cm_log <- confusionMatrix(pred_log_class, test_data$es_ies_factor, positive = "IES")
+
+cm_rf
+cm_log
+```
+
+## Comparación de Métricas
+
+```{r metricas}
+# Helper: extrae métricas clave de un objeto confusionMatrix
+metricas_cm <- function(cm, nombre) {
+  data.frame(
+    Modelo       = nombre,
+    Accuracy     = cm$overall["Accuracy"],
+    Kappa        = cm$overall["Kappa"],            # 0 = no mejora sobre el azar
+    Sensitivity  = cm$byClass["Sensitivity"],      # recall de IES
+    Specificity  = cm$byClass["Specificity"],      # recall de No_IES
+    Precision    = cm$byClass["Pos Pred Value"],
+    F1           = cm$byClass["F1"],
+    Balanced_Acc = cm$byClass["Balanced Accuracy"],
+    row.names    = NULL
+  )
+}
+
+metricas <- bind_rows(
+  metricas_cm(cm_rf,  "Random Forest (base)"),
+  metricas_cm(cm_log, "Regresión Logística (base)")
+) %>%
+  mutate(across(where(is.numeric), \(x) round(x, 4)))
+
+kable(metricas, caption = "Métricas de los modelos base (umbral 0.5)")
+
+mejor_f1 <- metricas$Modelo[which.max(metricas$F1)]
+```
+
+Diagnóstico: con clases desbalanceadas, un F1 o un Accuracy altos pueden **engañar**.
+La señal de alarma es **Kappa ≈ 0**, **Specificity ≈ 0** o **Balanced Accuracy ≈ 0.5**:
+significan que el modelo está prediciendo casi siempre la clase mayoritaria y no
+distingue de verdad. Si eso ocurre arriba, la sección siguiente lo corrige.
+
+## Curvas ROC y AUC
+
+```{r roc}
+# levels/direction explícitos para evitar advertencias de pROC y fijar la orientación
+roc_rf  <- roc(test_data$es_ies_factor, pred_rf_prob[, "IES"],
+               levels = c("No_IES", "IES"), direction = "<")
+roc_log <- roc(test_data$es_ies_factor, pred_log_prob,
+               levels = c("No_IES", "IES"), direction = "<")
+
+auc_rf  <- as.numeric(auc(roc_rf))
+auc_log <- as.numeric(auc(roc_log))
+
+p_roc <- ggplot() +
+  geom_path(aes(x = 1 - roc_rf$specificities,  y = roc_rf$sensitivities,
+                color = "Random Forest"), linewidth = 1) +
+  geom_path(aes(x = 1 - roc_log$specificities, y = roc_log$sensitivities,
+                color = "Regresión Logística"), linewidth = 1) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray60") +
+  scale_color_manual(values = c("Random Forest" = "#2E86AB",
+                                "Regresión Logística" = "#A23B72")) +
+  labs(
+    title = "Curvas ROC: comparación de modelos",
+    subtitle = paste0("AUC — RF: ", round(auc_rf, 3),
+                      " | Logística: ", round(auc_log, 3)),
+    x = "Tasa de falsos positivos (1 - especificidad)",
+    y = "Tasa de verdaderos positivos (recall)",
+    color = "Modelo"
+  ) +
+  coord_fixed() +
+  theme(legend.position = "bottom")
+
+p_roc
+```
+
+## Validación Cruzada (5-fold)
+
+```{r cv}
+set.seed(2026)
+
+cv_control <- trainControl(
+  method          = "cv",
+  number          = 5,
+  classProbs      = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+rf_cv <- train(es_ies_factor ~ ., data = datos_ml, method = "rf",
+               ntree = 300, trControl = cv_control, metric = "ROC")
+
+log_cv <- train(es_ies_factor ~ ., data = datos_ml, method = "glm",
+                family = binomial, trControl = cv_control, metric = "ROC")
+
+cv_resumen <- data.frame(
+  Modelo = c("Random Forest", "Regresión Logística"),
+  ROC = c(max(rf_cv$results$ROC), max(log_cv$results$ROC)),
+  Sensitivity = c(rf_cv$results$Sens[which.max(rf_cv$results$ROC)],
+                  log_cv$results$Sens[which.max(log_cv$results$ROC)]),
+  Specificity = c(rf_cv$results$Spec[which.max(rf_cv$results$ROC)],
+                  log_cv$results$Spec[which.max(log_cv$results$ROC)])
+) %>% mutate(across(where(is.numeric), \(x) round(x, 4)))
+
+kable(cv_resumen, caption = "Validación cruzada 5-fold (ROC/Sens/Spec)")
+```
+
+---
+
+# Manejo del Desbalance de Clase (Sesión 4)
+
+Cuando una clase domina, el modelo puede volverse "ciego a la minoría": predice casi
+siempre la clase mayoritaria y saca un Accuracy engañosamente alto. Siguiendo el
+`taller_desbalance` del curso, lo corregimos con **re-muestreo (`ROSE`)** y, además,
+**ajustando el umbral de decisión**.
+
+## Re-muestreo del entrenamiento con ROSE
+
+```{r desbalance-rose}
+set.seed(2026)
+
+# ovun.sample con method="both" combina sobre y submuestreo hasta equilibrar clases.
+# CLAVE: solo se re-muestrea el ENTRENAMIENTO. La prueba queda intacta (datos reales).
+train_bal <- ovun.sample(es_ies_factor ~ ., data = train_data,
+                         method = "both", N = nrow(train_data), seed = 2026)$data
+
+kable(
+  as.data.frame(table(train_bal$es_ies_factor)) %>% setNames(c("Clase", "Contratos")),
+  caption = "Entrenamiento después de balancear con ROSE"
+)
+
+# Reentrenar el Random Forest sobre la base balanceada
+set.seed(2026)
+rf_bal <- randomForest(es_ies_factor ~ ., data = train_bal,
+                       ntree = 500, mtry = 3, nodesize = 10, importance = TRUE)
+
+# Evaluar sobre la prueba ORIGINAL
+pred_bal_class <- predict(rf_bal, test_data)
+pred_bal_prob  <- predict(rf_bal, test_data, type = "prob")[, "IES"]
+cm_bal <- confusionMatrix(pred_bal_class, test_data$es_ies_factor, positive = "IES")
+cm_bal
+```
+
+## Ajuste del umbral de decisión
+
+```{r umbral}
+# ROC del modelo balanceado
+roc_bal <- roc(test_data$es_ies_factor, pred_bal_prob,
+               levels = c("No_IES", "IES"), direction = "<")
+
+# Umbral óptimo por índice de Youden (maximiza sensibilidad + especificidad).
+# En política pública este umbral es una PALANCA: subirlo prioriza precisión
+# (menos falsas alarmas); bajarlo prioriza recall (no dejar pasar convenios).
+umbral <- tryCatch({
+  co <- coords(roc_bal, x = "best", best.method = "youden",
+               ret = "threshold", transpose = FALSE)
+  as.numeric(co$threshold[1])
+}, error = function(e) 0.5)
+if (is.na(umbral) || length(umbral) == 0) umbral <- 0.5
+
+pred_umbral <- factor(ifelse(pred_bal_prob >= umbral, "IES", "No_IES"),
+                      levels = c("IES", "No_IES"))
+cm_umbral <- confusionMatrix(pred_umbral, test_data$es_ies_factor, positive = "IES")
+cm_umbral
+```
+
+## Comparación: antes vs. después
+
+```{r comparacion-final}
+comparacion <- bind_rows(
+  metricas_cm(cm_rf,     "RF base (umbral 0.5)"),
+  metricas_cm(cm_bal,    "RF balanceado ROSE (0.5)"),
+  metricas_cm(cm_umbral, paste0("RF balanceado + umbral ", round(umbral, 2)))
+) %>% mutate(across(where(is.numeric), \(x) round(x, 4)))
+
+kable(comparacion, caption = "Efecto de tratar el desbalance (conjunto de prueba)")
+```
+
+Lo que hay que mirar es que **Kappa**, **Specificity** y **Balanced Accuracy** dejen de
+ser ~0: eso indica que ahora el modelo sí distingue entre convenios IES y no-IES, no que
+"adivina" la mayoría. El AUC no cambia con el umbral (mide la capacidad de ordenar); lo
+que cambia es dónde ponemos el corte.
+
+---
+
+# Análisis de Importancia de Variables
+
+```{r feature-importance-viz}
+p_importance <- imp_rf %>%
+  ggplot(aes(x = reorder(Variable, MeanDecreaseGini), y = MeanDecreaseGini)) +
+  geom_col(fill = "#2E86AB", alpha = 0.85) +
+  geom_text(aes(label = round(MeanDecreaseGini, 1)), hjust = -0.1, size = 3.3) +
+  coord_flip() +
+  labs(
+    title = "Feature Importance - Random Forest",
+    subtitle = "Variables que más aportan a predecir convenios con IES",
+    x = NULL, y = "Mean Decrease in Gini"
+  ) +
+  expand_limits(y = max(imp_rf$MeanDecreaseGini) * 1.1)
+
+p_importance
+```
+
+Las tres variables más importantes según el Random Forest son:
+**`r paste(head(imp_rf$Variable, 3), collapse = ", ")`**.
+
+---
+
+# Conclusiones y Recomendaciones
+
+## Resumen ejecutivo
+
+**Pregunta:** ¿qué factores predicen que un contrato sea un convenio educativo con IES?
+
+Los modelos base, en umbral 0.5, tienden a predecir la clase mayoritaria (Kappa ≈ 0).
+El modelo que reportamos es el **Random Forest balanceado con ROSE y umbral ajustado**,
+que sí distingue entre clases. En el conjunto de prueba obtuvo:
+
+- **AUC-ROC:** `r round(as.numeric(auc(roc_bal)), 3)`
+- **Recall (detecta IES):** `r round(cm_umbral$byClass["Sensitivity"], 3)`
+- **Especificidad (detecta No_IES):** `r round(cm_umbral$byClass["Specificity"], 3)`
+- **Precisión:** `r round(cm_umbral$byClass["Pos Pred Value"], 3)`
+- **Kappa:** `r round(cm_umbral$overall["Kappa"], 3)`
+- **Balanced Accuracy:** `r round(cm_umbral$byClass["Balanced Accuracy"], 3)`
+
+**Hallazgo clave:** las variables más asociadas a un convenio IES son
+`r paste(head(imp_rf$Variable, 3), collapse = ", ")`. En particular, el tamaño del
+contrato pesa mucho: los convenios con IES tienden a ser considerablemente más grandes
+que el resto (concentran cerca de `r round(valor_ies_bill, 2)` billones de pesos).
+
+## Implicaciones para política pública
+
+1. **Clasificación asistida:** una vez validado por expertos, el modelo puede marcar
+   automáticamente contratos nuevos como candidatos a convenio IES en SECOP.
+2. **Monitoreo de inversión educativa:** rastrear en el tiempo el monto dirigido a IES
+   por dependencia y año.
+3. **Identificar brechas:** qué tipos de IES y qué dependencias concentran los recursos.
+4. **El umbral de decisión es una palanca de política:** subir el umbral prioriza
+   precisión (menos falsas alarmas); bajarlo prioriza recall (no dejar pasar convenios).
+   La elección depende del costo relativo de cada tipo de error.
+
+## Limitaciones
+
+- Es un modelo **predictivo, no causal**: identifica patrones, no relaciones causa-efecto.
+- **La etiqueta es la principal limitación.** Se construye por palabras clave y hereda
+  sus defectos: como ATENEA es una agencia de educación superior, términos como
+  "superior", "educacion" o "institucion" aparecen en gran parte de los contratos por
+  el nombre de la propia entidad, no porque sean convenios con una IES. Con la etiqueta
+  por palabras clave, ~43% de los contratos quedan marcados como IES; con una definición
+  estricta (que el proveedor sea realmente una universidad/IES), solo ~10% lo son, y
+  suman ~2,4 billones. Los resultados deben leerse teniendo esto presente, y conviene que
+  un experto de ATENEA valide una muestra de la clasificación.
+- Datos históricos (2022-2026); cambios en las modalidades de contratación pueden afectar
+  el desempeño futuro.
+- Consideraciones éticas: privacidad de proveedores y transparencia en los criterios de
+  clasificación.
+
+---
+
+# Apéndice: Información de Sesión
+
+```{r session}
+sessionInfo()
+```
+
+---
+
+**Documento generado automáticamente**
+Fecha: `r Sys.Date()`
